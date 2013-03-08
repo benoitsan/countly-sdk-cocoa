@@ -2,7 +2,7 @@
 This is an iOS and Mac OS X client library for [Countly](http://count.ly). It's based on the [official library](https://github.com/Countly/countly-sdk-ios).
 
 
-#Main differences with the official library
+##Main differences with the official library
 
 - Universal: iOS and OS X.
 - Not using [OpenUDID](https://github.com/ylechelle/OpenUDID).
