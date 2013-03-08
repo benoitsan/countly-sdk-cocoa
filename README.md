@@ -18,6 +18,7 @@ It uses ARC.
 * Drag the `Countly.h` and `Countly.m` class files into your project. 
 * For iOS, Add the Core Telephony framework `CoreTelephony.framework`.
 * Register your app:
+
 ``` objective-c
 #import "Countly.h"
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
