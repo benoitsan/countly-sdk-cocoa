@@ -11,7 +11,7 @@ extern NSString * const CountlyUserDefaultsUUID;
 
 @interface Countly : NSObject
 
-+ (Countly *)sharedInstance;
++ (instancetype)sharedInstance;
 
 - (void)start:(NSString *)appKey withHost:(NSString *)appHost;
 
