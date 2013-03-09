@@ -26,6 +26,9 @@
 #error Countly must be built with ARC.
 #endif
 
+NSString * const CountlyAttributesAPIKey = @"APIKey";
+NSString * const CountlyAttributesHost = @"host";
+NSString * const CountlyAttributesSessionDurationTrackingEnabled = @"sessionDurationTrackingEnabled";
 
 NSString * const CountlyUserDefaultsUUID = @"CountlyUUID";
 
@@ -200,6 +203,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 @property (nonatomic) CLYNetworkReachabilityRef networkReachability;
 @property (nonatomic) CLYNetworkReachabilityStatus networkReachabilityStatus;
 @property (nonatomic, readonly) BOOL isHostReachable;
+@property (nonatomic) BOOL shouldTrackSessionDuration;
 @end
 
 @implementation Countly
@@ -263,13 +267,15 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 
 #pragma mark - Public Methods
 
-- (void)start:(NSString *)appKey withHost:(NSString *)appHost {
-    NSParameterAssert(appKey);
-    NSParameterAssert(appHost);
-    
+- (void)startWithAttributes:(NSDictionary *)attributes {
     self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
-    self.appKey = appKey;
-    self.appHost = appHost;
+    
+    self.appKey = attributes[CountlyAttributesAPIKey];
+    self.appHost = attributes[CountlyAttributesHost];
+    self.shouldTrackSessionDuration = (attributes[CountlyAttributesSessionDurationTrackingEnabled]) ? [attributes[CountlyAttributesSessionDurationTrackingEnabled]boolValue] : YES;
+    
+    NSParameterAssert(self.appKey);
+    NSParameterAssert(self.appHost);
     
     [self startMonitoringNetworkReachability];
 }
@@ -343,7 +349,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
             });
         }];
     }
-    else if (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated) {
+    else if (self.shouldTrackSessionDuration && (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated)) {
         
         CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
         CFTimeInterval duration = round(lastTime - self.sessionsLastTime);
@@ -612,6 +618,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     return isHostReachable;
 }
 
+#pragma mark Reachability
 // based on the code of AFNetworking (https://github.com/AFNetworking/AFNetworking)
 
 static CLYNetworkReachabilityStatus CLYNetworkReachabilityStatusForFlags(SCNetworkReachabilityFlags flags) {

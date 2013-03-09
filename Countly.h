@@ -7,13 +7,17 @@
 
 #import <Foundation/Foundation.h>
 
+extern NSString * const CountlyAttributesAPIKey;
+extern NSString * const CountlyAttributesHost;
+extern NSString * const CountlyAttributesSessionDurationTrackingEnabled; // optional, enabled by default
+
 extern NSString * const CountlyUserDefaultsUUID;
 
 @interface Countly : NSObject
 
 + (instancetype)sharedInstance;
 
-- (void)start:(NSString *)appKey withHost:(NSString *)appHost;
+- (void)startWithAttributes:(NSDictionary *)attributes;
 
 - (void)recordEvent:(NSString *)key count:(NSUInteger)count;
 - (void)recordEvent:(NSString *)key count:(NSUInteger)count sum:(CGFloat)sum;
