@@ -15,8 +15,6 @@
 #import <CoreTelephony/CTCarrier.h>
 #endif
 
-#define COUNTLY_DEBUG
-
 #ifdef COUNTLY_DEBUG
 #   define COUNTLY_LOG(fmt, ...) NSLog(fmt, ## __VA_ARGS__)
 #else
@@ -134,6 +132,8 @@ static NSString * CLYSystemInfoForKey(char *key) {
         }
     });
     
+    COUNTLY_LOG(@"flushAllEvents (%lu events)", (unsigned long)retEvents.count);
+    
     return retEvents;
 }
 
@@ -169,20 +169,21 @@ static NSString * CLYSystemInfoForKey(char *key) {
 
 typedef NS_ENUM(NSUInteger, CountlySessionState) {
     CountlySessionStateStopped,
-    CountlySessionStateStarted,
+    CountlySessionStateBegan,
+    CountlySessionStateUpdated,
     CountlySessionStatePending
 };
 
 @interface Countly () 
 
 @property (nonatomic) NSTimer *sessionTimer;
-@property (atomic) CFTimeInterval sessionsLastTime;
+@property (nonatomic) CFTimeInterval sessionsLastTime;
 @property (nonatomic) CLYEventQueue *eventQueue;
 @property (nonatomic) NSString *appKey;
 @property (nonatomic) NSString *appHost;
 @property (nonatomic) NSString *UUID;
-@property (atomic) CountlySessionState sessionState;
-@property (atomic) BOOL sessionConnectionFailed;
+@property (nonatomic) CountlySessionState sessionState;
+@property (nonatomic) BOOL sessionConnectionFailed;
 @property (nonatomic) BOOL applicationInBackgroundState;
 @property (nonatomic) NSOperationQueue *httpOperationQueue;
 @end
@@ -278,7 +279,7 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     
     [self.eventQueue recordEvent:key segmentation:segmentation count:count sum:sum];
     
-    if (self.eventQueue.count >= 5) [self flushPendingEvents];
+    if (self.eventQueue.count >= 5) [self sendPendingEvents];
     
 }
 
@@ -290,21 +291,25 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
         self.sessionTimer = nil;
     }
     else if (!self.sessionTimer) {
-        self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(timerFired:) userInfo:nil repeats:YES];
+        self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self selector:@selector(timerFired:) userInfo:nil repeats:YES];
     }
     
     if (self.sessionState == CountlySessionStateStopped) {
         self.sessionState = CountlySessionStatePending;
-        
         [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionBegin]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-            self.sessionConnectionFailed = (error != nil);
-            if (!error) {
-                self.sessionState = CountlySessionStateStarted;
-                self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
-            }
+            dispatch_async(dispatch_get_main_queue(), ^(void) {
+                self.sessionConnectionFailed = (error != nil);
+                if (!error) {
+                    self.sessionState = CountlySessionStateBegan;
+                    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
+                }
+                else {
+                    self.sessionState = CountlySessionStateStopped;
+                }
+            });
         }];
     }
-    else if (self.sessionState == CountlySessionStateStarted) {
+    else if (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated) {
         self.sessionState = CountlySessionStatePending;
         
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
@@ -317,21 +322,43 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
         self.sessionsLastTime = lastTime;
         
         [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionUpdateWithDuration:duration]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-            if (!error) {
-                self.sessionState = CountlySessionStateStarted;
-            }
-            else {
-                self.sessionState = CountlySessionStateStopped;
-            }
+            dispatch_async(dispatch_get_main_queue(), ^(void) {
+                if (!error) {
+                    self.sessionState = CountlySessionStateUpdated;
+                }
+                else {
+                    self.sessionState = CountlySessionStateStopped;
+                }
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
 #endif
+            });
         }];
     }
 }
 
+- (void)setSessionState:(CountlySessionState)sessionState {
+    if (sessionState != _sessionState) {
+        _sessionState = sessionState;
+#ifdef DEBUG
+        if (_sessionState == CountlySessionStateBegan) {
+            COUNTLY_LOG(@"session state: began");
+        }
+        if (_sessionState == CountlySessionStateUpdated) {
+            COUNTLY_LOG(@"session state: updated");
+        }
+        else if (_sessionState == CountlySessionStatePending) {
+            COUNTLY_LOG(@"session state: pending");
+        }
+        else if (_sessionState == CountlySessionStateStopped) {
+            COUNTLY_LOG(@"session state: stopped");
+        }
+#endif
+    }
+}
+
 - (void)timerFired:(NSTimer *)timer {
-    [self flushPendingEvents];
+    [self sendPendingEvents];
     [self updateSessionState];
 }
 
@@ -352,7 +379,56 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 }
 #endif
 
-#pragma mark - Countly Back-End API
+#pragma mark - Countly Events Management
+
+- (void)sendPendingEvents {
+    NSArray *events = [self.eventQueue flushAllEvents];
+    
+    if (events.count > 0 && !self.sessionConnectionFailed) {
+        
+        NSMutableArray *mutableArray = [NSMutableArray array];
+        
+        [events enumerateObjectsWithOptions:0 usingBlock:^(CLYEvent *event, NSUInteger idx, BOOL *stop) {
+            NSMutableDictionary *mutableDictionary = [NSMutableDictionary dictionary];
+            [mutableDictionary setObject:event.key forKey:@"key"];
+            [mutableDictionary setObject:@(event.count) forKey:@"count"];
+            [mutableDictionary setObject:@(event.timestamp) forKey:@"timestamp"];
+            if (event.sum > 0) [mutableDictionary setObject:@(event.sum) forKey:@"sum"];
+            if (event.segmentation.allKeys.count > 0) [mutableDictionary setObject:event.segmentation forKey:@"segmentation"];
+            
+            [mutableArray addObject:mutableDictionary];
+        }];
+        
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableArray options:0 error:nil];
+        NSString *jsonEncodedEvents = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        
+        NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&events=%@",
+                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
+                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
+                          time(NULL),
+                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedEvents)];
+        
+        NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
+        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+        
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+        }];
+#endif
+        
+        COUNTLY_LOG(@"sendPendingEvents - start");
+        [NSURLConnection sendAsynchronousRequest:request queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+            COUNTLY_LOG(@"sendPendingEvents - finished");
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+#endif
+        }];
+        
+    }
+}
+
+#pragma mark - Countly API Requests
 
 - (NSURLRequest *)urlRequestForSessionBegin {
     
@@ -463,53 +539,6 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
     NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     return request;
-}
-
-#pragma mark - Countly Events Management
-
-- (void)flushPendingEvents {
-    NSArray *events = [self.eventQueue flushAllEvents];
-    
-    if (events.count > 0 && !self.sessionConnectionFailed) {
-        
-        NSMutableArray *mutableArray = [NSMutableArray array];
-        
-        [events enumerateObjectsWithOptions:0 usingBlock:^(CLYEvent *event, NSUInteger idx, BOOL *stop) {
-            NSMutableDictionary *mutableDictionary = [NSMutableDictionary dictionary];
-            [mutableDictionary setObject:event.key forKey:@"key"];
-            [mutableDictionary setObject:@(event.count) forKey:@"count"];
-            [mutableDictionary setObject:@(event.timestamp) forKey:@"timestamp"];
-            if (event.sum > 0) [mutableDictionary setObject:@(event.sum) forKey:@"sum"];
-            if (event.segmentation.allKeys.count > 0) [mutableDictionary setObject:event.segmentation forKey:@"segmentation"];
-            
-            [mutableArray addObject:mutableDictionary];
-        }];
-        
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableArray options:0 error:nil];
-        NSString *jsonEncodedEvents = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-        
-        NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&events=%@",
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
-                          time(NULL),
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedEvents)];
-        
-        NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
-        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
-        }];
-#endif
-        
-        [NSURLConnection sendAsynchronousRequest:request queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
-#endif
-        }];
-        
-    }
 }
 
 @end
