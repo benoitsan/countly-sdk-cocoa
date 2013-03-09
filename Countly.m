@@ -167,22 +167,24 @@ static NSString * CLYSystemInfoForKey(char *key) {
 
 @end
 
+typedef NS_ENUM(NSUInteger, CountlySessionState) {
+    CountlySessionStateStopped,
+    CountlySessionStateStarted,
+    CountlySessionStatePending
+};
 
-@interface Countly () {
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    UIBackgroundTaskIdentifier _backgroundTaskIdentifier;
-#endif
-}
+@interface Countly () 
 
 @property (nonatomic) NSTimer *sessionTimer;
-@property (nonatomic) NSMutableArray *httpQueue;
-@property (nonatomic) NSURLConnection *connection;
-@property (nonatomic) CFTimeInterval sessionsLastTime;
-@property (nonatomic) BOOL sessionStarted;
+@property (atomic) CFTimeInterval sessionsLastTime;
 @property (nonatomic) CLYEventQueue *eventQueue;
 @property (nonatomic) NSString *appKey;
 @property (nonatomic) NSString *appHost;
 @property (nonatomic) NSString *UUID;
+@property (atomic) CountlySessionState sessionState;
+@property (atomic) BOOL sessionConnectionFailed;
+@property (nonatomic) BOOL applicationInBackgroundState;
+@property (nonatomic) NSOperationQueue *httpOperationQueue;
 @end
 
 @implementation Countly
@@ -204,6 +206,9 @@ static NSString * CLYSystemInfoForKey(char *key) {
     if (self = [super init]) {
         NSAssert([NSThread isMainThread], @"Countly class should be initialized on the main thread");
         
+        self.httpOperationQueue = [[NSOperationQueue alloc] init];
+        self.httpOperationQueue.maxConcurrentOperationCount = 2;
+        
         self.UUID = [[[NSUserDefaults standardUserDefaults] objectForKey:@"OpenUDID"] objectForKey:@"OpenUDID"]; //legacy UDID
         
         if (!self.UUID) {
@@ -218,12 +223,7 @@ static NSString * CLYSystemInfoForKey(char *key) {
             }
         }
         
-        self.httpQueue = [[NSMutableArray alloc] init];
         self.eventQueue = [[CLYEventQueue alloc] init];
-
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-        _backgroundTaskIdentifier = UIBackgroundTaskInvalid;
-#endif
         
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didEnterBackgroundNotification:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -240,7 +240,6 @@ static NSString * CLYSystemInfoForKey(char *key) {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillEnterForegroundNotification object:nil];
 #endif
     [self.sessionTimer invalidate];
-    [self.connection cancel];
 }
 
 #pragma mark - Public Methods
@@ -251,7 +250,7 @@ static NSString * CLYSystemInfoForKey(char *key) {
     
     self.appKey = appKey;
     self.appHost = appHost;
-    self.sessionStarted = YES;
+    [self updateSessionState];
 }
 
 - (void)recordEvent:(NSString *)key count:(NSUInteger)count {
@@ -279,34 +278,61 @@ static NSString * CLYSystemInfoForKey(char *key) {
     
     [self.eventQueue recordEvent:key segmentation:segmentation count:count sum:sum];
     
-    if (self.eventQueue.count >= 5) [self recordPendingEvents];
+    if (self.eventQueue.count >= 5) [self flushPendingEvents];
+    
 }
 
 #pragma mark - Session Management
 
-- (void)setSessionStarted:(BOOL)sessionStarted {
-    if (sessionStarted != _sessionStarted) {
-        _sessionStarted = sessionStarted;
-        if (sessionStarted) {
-            [self beginSession];
-            [self.sessionTimer invalidate];
-            self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self selector:@selector(timerFired:) userInfo:nil repeats:YES];
-            self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
-        }
-        else {
-            [self.sessionTimer invalidate];
-            self.sessionTimer = nil;
-            [self recordPendingEvents];
-            [self endSession];
-        }
+- (void)updateSessionState {
+    if (self.applicationInBackgroundState) {
+        [self.sessionTimer invalidate];
+        self.sessionTimer = nil;
+    }
+    else if (!self.sessionTimer) {
+        self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(timerFired:) userInfo:nil repeats:YES];
+    }
+    
+    if (self.sessionState == CountlySessionStateStopped) {
+        self.sessionState = CountlySessionStatePending;
+        
+        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionBegin]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+            self.sessionConnectionFailed = (error != nil);
+            if (!error) {
+                self.sessionState = CountlySessionStateStarted;
+                self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
+            }
+        }];
+    }
+    else if (self.sessionState == CountlySessionStateStarted) {
+        self.sessionState = CountlySessionStatePending;
+        
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+        }];
+#endif
+        CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
+        CFTimeInterval duration = lastTime - self.sessionsLastTime;
+        self.sessionsLastTime = lastTime;
+        
+        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionUpdateWithDuration:duration]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+            if (!error) {
+                self.sessionState = CountlySessionStateStarted;
+            }
+            else {
+                self.sessionState = CountlySessionStateStopped;
+            }
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+#endif
+        }];
     }
 }
 
 - (void)timerFired:(NSTimer *)timer {
-    if (self.sessionStarted) {
-        [self recordPendingEvents];
-        [self updateSession];
-    }
+    [self flushPendingEvents];
+    [self updateSessionState];
 }
 
 #pragma mark - Notifications
@@ -314,18 +340,21 @@ static NSString * CLYSystemInfoForKey(char *key) {
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
 - (void)didEnterBackgroundNotification:(NSNotification *)notification {
     COUNTLY_LOG(@"Countly didEnterBackgroundCallBack");
-    self.sessionStarted = NO;
+    self.applicationInBackgroundState = YES;
+    [self updateSessionState];
 }
 
 - (void)willEnterForegroundNotification:(NSNotification *)notification {
     COUNTLY_LOG(@"Countly willEnterForegroundCallBack");
-    self.sessionStarted = YES;
+    self.applicationInBackgroundState = NO;
+    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
+    [self updateSessionState];
 }
 #endif
 
-#pragma mark - Back-End API
+#pragma mark - Countly Back-End API
 
-- (void)beginSession {
+- (NSURLRequest *)urlRequestForSessionBegin {
     
     NSMutableDictionary *metrics = [NSMutableDictionary dictionary];
     
@@ -418,14 +447,12 @@ static NSString * CLYSystemInfoForKey(char *key) {
                       kCountlyVersion,
                       CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedMetrics)];
     
-    [self.httpQueue addObject:data];
-    [self tick];
+    NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
+    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    return request;
 }
 
-- (void)updateSession {
-    CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
-    CFTimeInterval duration = lastTime - self.sessionsLastTime;
-    self.sessionsLastTime = lastTime;
+- (NSURLRequest *)urlRequestForSessionUpdateWithDuration:(CFTimeInterval)duration {
     
     NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&session_duration=%d",
                       CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
@@ -433,28 +460,17 @@ static NSString * CLYSystemInfoForKey(char *key) {
                       time(NULL),
                       (int)duration];
     
-    [self.httpQueue addObject:data];
-    [self tick];
+    NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
+    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    return request;
 }
 
-- (void)endSession {
-    CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
-    CFTimeInterval duration = lastTime - self.sessionsLastTime;
-    self.sessionsLastTime = lastTime;
-    
-    NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&end_session=1&session_duration=%d",
-                      CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
-                      CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
-                      time(NULL),
-                      (int)duration];
-    
-    [self.httpQueue addObject:data];
-    [self tick];
-}
+#pragma mark - Countly Events Management
 
-- (void)recordPendingEvents {
+- (void)flushPendingEvents {
     NSArray *events = [self.eventQueue flushAllEvents];
-    if (events.count > 0) {
+    
+    if (events.count > 0 && !self.sessionConnectionFailed) {
         
         NSMutableArray *mutableArray = [NSMutableArray array];
         
@@ -468,7 +484,7 @@ static NSString * CLYSystemInfoForKey(char *key) {
             
             [mutableArray addObject:mutableDictionary];
         }];
-                
+        
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableArray options:0 error:nil];
         NSString *jsonEncodedEvents = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
         
@@ -478,56 +494,26 @@ static NSString * CLYSystemInfoForKey(char *key) {
                           time(NULL),
                           CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedEvents)];
         
-        [self.httpQueue addObject:data];
-        [self tick];
+        NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
+        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+        }];
+#endif
+        
+        [NSURLConnection sendAsynchronousRequest:request queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+#endif
+        }];
+        
     }
 }
 
-#pragma mark - HTTP Connection
-
-- (void)tick {    
-    if (self.connection || [self.httpQueue count] == 0) return;
-    
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    _backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-        [self endBackgroundTask];
-    }];
-#endif
-    
-    NSString *data = [self.httpQueue objectAtIndex:0];
-    NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
-    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-    self.connection = [NSURLConnection connectionWithRequest:request delegate:self];
-}
-
-- (void)endBackgroundTask {
-    self.connection = nil;
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    UIApplication *app = [UIApplication sharedApplication];
-    [app endBackgroundTask:_backgroundTaskIdentifier];
-    _backgroundTaskIdentifier = UIBackgroundTaskInvalid;
-#endif
-}
-
-- (void)connectionDidFinishLoading:(NSURLConnection *)connection {
-    COUNTLY_LOG(@"ok -> %@", [self.httpQueue objectAtIndex:0]);
-    [self endBackgroundTask];
-    [self.httpQueue removeObjectAtIndex:0];
-    [self tick];
-}
-
-- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)err {
-    COUNTLY_LOG(@"error -> %@: %@", [self.httpQueue objectAtIndex:0], err);
-    [self endBackgroundTask];
-}
-
-#ifdef COUNTLY_ALLOW_INVALID_SSL_CERTIFICATES
-- (void)connection:(NSURLConnection *)connection willSendRequestForAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge {
-    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) [challenge.sender useCredential:[NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust] forAuthenticationChallenge:challenge];
-    
-    [[challenge sender] continueWithoutCredentialForAuthenticationChallenge:challenge];
-}
-
-#endif
-
 @end
+
+
+
+
