@@ -485,14 +485,8 @@ static NSString * CLYSystemInfoForKey(char *key) {
 
 #pragma mark - HTTP Connection
 
-- (void)tick {
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    BOOL isBackgroundTaskValid = (_backgroundTaskIdentifier != UIBackgroundTaskInvalid);
-#else
-    BOOL isBackgroundTaskValid = NO;
-#endif
-    
-    if (self.connection || isBackgroundTaskValid || [self.httpQueue count] == 0) return;
+- (void)tick {    
+    if (self.connection || [self.httpQueue count] == 0) return;
     
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
     _backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
@@ -507,6 +501,7 @@ static NSString * CLYSystemInfoForKey(char *key) {
 }
 
 - (void)endBackgroundTask {
+    self.connection = nil;
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
     UIApplication *app = [UIApplication sharedApplication];
     [app endBackgroundTask:_backgroundTaskIdentifier];
@@ -517,7 +512,6 @@ static NSString * CLYSystemInfoForKey(char *key) {
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection {
     COUNTLY_LOG(@"ok -> %@", [self.httpQueue objectAtIndex:0]);
     [self endBackgroundTask];
-    self.connection = nil;
     [self.httpQueue removeObjectAtIndex:0];
     [self tick];
 }
@@ -525,7 +519,6 @@ static NSString * CLYSystemInfoForKey(char *key) {
 - (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)err {
     COUNTLY_LOG(@"error -> %@: %@", [self.httpQueue objectAtIndex:0], err);
     [self endBackgroundTask];
-    self.connection = nil;
 }
 
 #ifdef COUNTLY_ALLOW_INVALID_SSL_CERTIFICATES
