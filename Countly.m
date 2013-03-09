@@ -6,6 +6,7 @@
 
 #import "Countly.h"
 #import <Foundation/Foundation.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #include <sys/sysctl.h>
 
@@ -24,6 +25,7 @@
 #if !__has_feature(objc_arc)
 #error Countly must be built with ARC.
 #endif
+
 
 NSString * const CountlyUserDefaultsUUID = @"CountlyUUID";
 
@@ -174,6 +176,16 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     CountlySessionStatePending
 };
 
+typedef enum {
+    CLYNetworkReachabilityStatusUnknown          = -1,
+    CLYNetworkReachabilityStatusNotReachable     = 0,
+    CLYNetworkReachabilityStatusReachableViaWWAN = 1,
+    CLYNetworkReachabilityStatusReachableViaWiFi = 2,
+} CLYNetworkReachabilityStatus;
+
+typedef SCNetworkReachabilityRef CLYNetworkReachabilityRef;
+typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus status);
+
 @interface Countly () 
 
 @property (nonatomic) NSTimer *sessionTimer;
@@ -183,9 +195,11 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 @property (nonatomic) NSString *appHost;
 @property (nonatomic) NSString *UUID;
 @property (nonatomic) CountlySessionState sessionState;
-@property (nonatomic) BOOL sessionConnectionFailed;
 @property (nonatomic) BOOL applicationInBackgroundState;
 @property (nonatomic) NSOperationQueue *httpOperationQueue;
+@property (nonatomic) CLYNetworkReachabilityRef networkReachability;
+@property (nonatomic) CLYNetworkReachabilityStatus networkReachabilityStatus;
+@property (nonatomic, readonly) BOOL isHostReachable;
 @end
 
 @implementation Countly
@@ -209,6 +223,8 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
         
         self.httpOperationQueue = [[NSOperationQueue alloc] init];
         self.httpOperationQueue.maxConcurrentOperationCount = 2;
+        
+        self.networkReachabilityStatus = CLYNetworkReachabilityStatusUnknown;
         
         self.UUID = [[[NSUserDefaults standardUserDefaults] objectForKey:@"OpenUDID"] objectForKey:@"OpenUDID"]; //legacy UDID
         
@@ -240,6 +256,8 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillEnterForegroundNotification object:nil];
 #endif
+    [self stopMonitoringNetworkReachability];
+    [self.httpOperationQueue cancelAllOperations];
     [self.sessionTimer invalidate];
 }
 
@@ -249,9 +267,11 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     NSParameterAssert(appKey);
     NSParameterAssert(appHost);
     
+    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
     self.appKey = appKey;
     self.appHost = appHost;
-    [self updateSessionState];
+    
+    [self startMonitoringNetworkReachability];
 }
 
 - (void)recordEvent:(NSString *)key count:(NSUInteger)count {
@@ -268,6 +288,11 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 
 - (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
     NSParameterAssert(key);
+    
+    if (!self.isHostReachable && self.networkReachabilityStatus != CLYNetworkReachabilityStatusUnknown) {
+        return; // avoid to accumulate events if the connection is failing.
+    }
+    
 #ifdef DEBUG
     [segmentation.allKeys enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
         NSAssert([obj isKindOfClass:[NSString class]], @"keys of the segmentation dictionary should be NSString objects");
@@ -286,7 +311,7 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 #pragma mark - Session Management
 
 - (void)updateSessionState {
-    if (self.applicationInBackgroundState) {
+    if (self.applicationInBackgroundState || !self.isHostReachable) {
         [self.sessionTimer invalidate];
         self.sessionTimer = nil;
     }
@@ -296,37 +321,20 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
     
     if (self.sessionState == CountlySessionStateStopped) {
         self.sessionState = CountlySessionStatePending;
-        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionBegin]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^(void) {
-                self.sessionConnectionFailed = (error != nil);
-                if (!error) {
-                    self.sessionState = CountlySessionStateBegan;
-                    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
-                }
-                else {
-                    self.sessionState = CountlySessionStateStopped;
-                }
-            });
-        }];
-    }
-    else if (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated) {
-        self.sessionState = CountlySessionStatePending;
         
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
         __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            self.sessionState = CountlySessionStateStopped;
             [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
         }];
 #endif
-        CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
-        CFTimeInterval duration = lastTime - self.sessionsLastTime;
-        self.sessionsLastTime = lastTime;
-        
-        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionUpdateWithDuration:duration]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionBegin]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^(void) {
                 if (!error) {
-                    self.sessionState = CountlySessionStateUpdated;
+                    self.sessionState = CountlySessionStateBegan;
                 }
                 else {
+                    COUNTLY_LOG(@"updateSessionState - connection error: %@",error);
                     self.sessionState = CountlySessionStateStopped;
                 }
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
@@ -334,6 +342,39 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 #endif
             });
         }];
+    }
+    else if (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated) {
+        
+        CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
+        CFTimeInterval duration = round(lastTime - self.sessionsLastTime);
+        self.sessionsLastTime = lastTime;
+        COUNTLY_LOG(@"session duration: %f sec.",duration);
+        
+        if (duration > 0) {
+            self.sessionState = CountlySessionStatePending;
+            
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+            __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+                self.sessionState = CountlySessionStateBegan;
+                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+            }];
+#endif
+            
+            [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionUpdateWithDuration:duration]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^(void) {
+                    if (!error) {
+                        self.sessionState = CountlySessionStateUpdated;
+                    }
+                    else {
+                        COUNTLY_LOG(@"updateSessionState - connection error: %@",error);
+                        self.sessionState = CountlySessionStateBegan;
+                    }
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+                    [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+#endif
+                });
+            }];
+        }
     }
 }
 
@@ -384,7 +425,7 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 - (void)sendPendingEvents {
     NSArray *events = [self.eventQueue flushAllEvents];
     
-    if (events.count > 0 && !self.sessionConnectionFailed) {
+    if (events.count > 0) {
         
         NSMutableArray *mutableArray = [NSMutableArray array];
         
@@ -431,7 +472,6 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 #pragma mark - Countly API Requests
 
 - (NSURLRequest *)urlRequestForSessionBegin {
-    
     NSMutableDictionary *metrics = [NSMutableDictionary dictionary];
     
     // LOCALE
@@ -530,15 +570,124 @@ typedef NS_ENUM(NSUInteger, CountlySessionState) {
 
 - (NSURLRequest *)urlRequestForSessionUpdateWithDuration:(CFTimeInterval)duration {
     
-    NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&session_duration=%d",
+    NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&session_duration=%f",
                       CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
                       CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
                       time(NULL),
-                      (int)duration];
+                      round(duration)];
     
     NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
     NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     return request;
+}
+
+#pragma mark - Network Reachability
+
+- (void)setNetworkReachabilityStatus:(CLYNetworkReachabilityStatus)networkReachabilityStatus {
+    if (networkReachabilityStatus != _networkReachabilityStatus) {
+        _networkReachabilityStatus = networkReachabilityStatus;
+        
+#ifdef DEBUG
+        if (_networkReachabilityStatus == CLYNetworkReachabilityStatusUnknown) {
+            COUNTLY_LOG(@"reachability changed: unknown");
+        }
+        if (_networkReachabilityStatus == CLYNetworkReachabilityStatusNotReachable) {
+            COUNTLY_LOG(@"reachability changed: not reachable");
+        }
+        else {
+            COUNTLY_LOG(@"reachability changed: reachable");
+        }
+#endif
+        if (_networkReachabilityStatus != CLYNetworkReachabilityStatusUnknown) {
+            [self updateSessionState];
+            if (!self.isHostReachable) {
+                [self.eventQueue flushAllEvents];
+            }
+        }
+    }
+}
+
+- (BOOL)isHostReachable {
+    BOOL isHostReachable = (self.networkReachabilityStatus == CLYNetworkReachabilityStatusReachableViaWWAN || self.networkReachabilityStatus == CLYNetworkReachabilityStatusReachableViaWiFi);
+    return isHostReachable;
+}
+
+// based on the code of AFNetworking (https://github.com/AFNetworking/AFNetworking)
+
+static CLYNetworkReachabilityStatus CLYNetworkReachabilityStatusForFlags(SCNetworkReachabilityFlags flags) {
+    BOOL isReachable = ((flags & kSCNetworkReachabilityFlagsReachable) != 0);
+    BOOL needsConnection = ((flags & kSCNetworkReachabilityFlagsConnectionRequired) != 0);
+    BOOL isNetworkReachable = (isReachable && !needsConnection);
+    
+    CLYNetworkReachabilityStatus status = CLYNetworkReachabilityStatusUnknown;
+    if (isNetworkReachable == NO) {
+        status = CLYNetworkReachabilityStatusNotReachable;
+    }
+#if	TARGET_OS_IPHONE
+    else if ((flags & kSCNetworkReachabilityFlagsIsWWAN) != 0) {
+        status = CLYNetworkReachabilityStatusReachableViaWWAN;
+    }
+#endif
+    else {
+        status = CLYNetworkReachabilityStatusReachableViaWiFi;
+    }
+    
+    return status;
+}
+
+static void CLYNetworkReachabilityCallback(SCNetworkReachabilityRef __unused target, SCNetworkReachabilityFlags flags, void *info) {
+    CLYNetworkReachabilityStatus status = CLYNetworkReachabilityStatusForFlags(flags);
+    CLYNetworkReachabilityStatusBlock block = (__bridge CLYNetworkReachabilityStatusBlock)info;
+    if (block) {
+        block(status);
+    }
+}
+
+static const void * CLYNetworkReachabilityRetainCallback(const void *info) {
+    return (__bridge_retained const void *)([(__bridge CLYNetworkReachabilityStatusBlock)info copy]);
+}
+
+static void CLYNetworkReachabilityReleaseCallback(const void *info) {
+    if (info) {
+        CFRelease(info);
+    }
+}
+
+- (void)startMonitoringNetworkReachability {
+    [self stopMonitoringNetworkReachability];
+    
+    if (!self.appHost) {
+        return;
+    }
+    
+    self.networkReachability = SCNetworkReachabilityCreateWithName(kCFAllocatorDefault, [[[NSURL URLWithString:self.appHost] host] UTF8String]);
+    
+    if (!self.networkReachability) {
+        return;
+    }
+    
+    __weak __typeof(&*self)weakSelf = self;
+    CLYNetworkReachabilityStatusBlock callback = ^(CLYNetworkReachabilityStatus status) {
+        __strong __typeof(&*weakSelf)strongSelf = weakSelf;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            strongSelf.networkReachabilityStatus = status;
+        });
+    };
+    
+    SCNetworkReachabilityContext context = {0, (__bridge void *)callback, CLYNetworkReachabilityRetainCallback, CLYNetworkReachabilityReleaseCallback, NULL};
+    SCNetworkReachabilitySetCallback(self.networkReachability, CLYNetworkReachabilityCallback, &context);
+    SCNetworkReachabilityScheduleWithRunLoop(self.networkReachability, CFRunLoopGetMain(), (CFStringRef)NSRunLoopCommonModes);
+    
+    SCNetworkReachabilityFlags flags;
+    SCNetworkReachabilityGetFlags(self.networkReachability, &flags);
+}
+
+- (void)stopMonitoringNetworkReachability {
+    if (_networkReachability) {
+        SCNetworkReachabilityUnscheduleFromRunLoop(_networkReachability, CFRunLoopGetMain(), (CFStringRef)NSRunLoopCommonModes);
+        CFRelease(_networkReachability);
+        _networkReachability = NULL;
+    }
 }
 
 @end
