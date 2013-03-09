@@ -29,6 +29,7 @@
 NSString * const CountlyAttributesAPIKey = @"APIKey";
 NSString * const CountlyAttributesHost = @"host";
 NSString * const CountlyAttributesSessionDurationTrackingEnabled = @"sessionDurationTrackingEnabled";
+NSString * const CountlyAttributesEvictEventsTrackingViaWWAN = @"evictEventsTrackingViaWWAN";
 
 NSString * const CountlyUserDefaultsUUID = @"CountlyUUID";
 
@@ -204,6 +205,8 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 @property (nonatomic) CLYNetworkReachabilityStatus networkReachabilityStatus;
 @property (nonatomic, readonly) BOOL isHostReachable;
 @property (nonatomic) BOOL shouldTrackSessionDuration;
+@property (nonatomic, readonly) BOOL shouldTrackEvents;
+@property (nonatomic) BOOL evictEventsTrackingViaWWAN;
 @end
 
 @implementation Countly
@@ -273,6 +276,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     self.appKey = attributes[CountlyAttributesAPIKey];
     self.appHost = attributes[CountlyAttributesHost];
     self.shouldTrackSessionDuration = (attributes[CountlyAttributesSessionDurationTrackingEnabled]) ? [attributes[CountlyAttributesSessionDurationTrackingEnabled]boolValue] : YES;
+    self.evictEventsTrackingViaWWAN = (attributes[CountlyAttributesEvictEventsTrackingViaWWAN]) ? [attributes[CountlyAttributesEvictEventsTrackingViaWWAN]boolValue] : NO;
     
     NSParameterAssert(self.appKey);
     NSParameterAssert(self.appHost);
@@ -295,7 +299,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 - (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
     NSParameterAssert(key);
     
-    if (!self.isHostReachable && self.networkReachabilityStatus != CLYNetworkReachabilityStatusUnknown) {
+    if (!self.shouldTrackEvents) {
         return; // avoid to accumulate events if the connection is failing.
     }
     
@@ -427,6 +431,11 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 #endif
 
 #pragma mark - Countly Events Management
+
+- (BOOL)shouldTrackEvents {
+    BOOL shouldTrackEvents = (!self.evictEventsTrackingViaWWAN && (self.isHostReachable || self.networkReachabilityStatus == CLYNetworkReachabilityStatusUnknown));
+    return shouldTrackEvents;
+}
 
 - (void)sendPendingEvents {
     NSArray *events = [self.eventQueue flushAllEvents];
@@ -606,7 +615,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 #endif
         if (_networkReachabilityStatus != CLYNetworkReachabilityStatusUnknown) {
             [self updateSessionState];
-            if (!self.isHostReachable) {
+            if (!self.shouldTrackEvents) {
                 [self.eventQueue flushAllEvents];
             }
         }

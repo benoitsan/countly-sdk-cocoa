@@ -9,7 +9,8 @@
 
 extern NSString * const CountlyAttributesAPIKey;
 extern NSString * const CountlyAttributesHost;
-extern NSString * const CountlyAttributesSessionDurationTrackingEnabled; // optional, enabled by default
+extern NSString * const CountlyAttributesSessionDurationTrackingEnabled; // optional, default is YES
+extern NSString * const CountlyAttributesEvictEventsTrackingViaWWAN; // optional, default is NO
 
 extern NSString * const CountlyUserDefaultsUUID;
 
