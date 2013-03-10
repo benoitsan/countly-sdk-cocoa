@@ -9,6 +9,7 @@
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #include <sys/sysctl.h>
+#include <libkern/OSAtomic.h>
 
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
 #import <UIKit/UIKit.h>
@@ -30,6 +31,7 @@ NSString * const CountlyAttributesAPIKey = @"APIKey";
 NSString * const CountlyAttributesHost = @"host";
 NSString * const CountlyAttributesSessionDurationTrackingEnabled = @"sessionDurationTrackingEnabled";
 NSString * const CountlyAttributesEvictEventsTrackingViaWWAN = @"evictEventsTrackingViaWWAN";
+NSString * const CountlyAttributesSessionDurationUpdateInterval = @"sessionDurationUpdateInterval";
 
 NSString * const CountlyUserDefaultsUUID = @"CountlyUUID";
 
@@ -88,7 +90,7 @@ static NSString * CLYSystemInfoForKey(char *key) {
 
 @interface CLYEvent : NSObject
 
-@property (nonatomic, copy) NSString *key;
+@property (nonatomic) NSString *key;
 @property (nonatomic) NSDictionary *segmentation;
 @property (nonatomic) NSUInteger count;
 @property (nonatomic) CGFloat sum;
@@ -100,38 +102,47 @@ static NSString * CLYSystemInfoForKey(char *key) {
 
 @end
 
-@interface CLYEventQueue : NSObject {
+static int32_t queueCounter = 0;
+
+@interface CLYEventStack : NSObject {
     NSMutableArray *_events;
     dispatch_queue_t _queue;
 }
 
 @end
 
-@implementation CLYEventQueue
+@implementation CLYEventStack
 
 - (id)init {
     if (self = [super init]) {
         _events = [[NSMutableArray alloc] init];
-        _queue = dispatch_queue_create("com.countly.eventqueue", DISPATCH_QUEUE_CONCURRENT);
+        _queue = dispatch_queue_create("com.countly.eventStack", DISPATCH_QUEUE_CONCURRENT);
+        
+        const char *label = [[NSString stringWithFormat:@"com.countly.eventstack-%i", OSAtomicIncrement32(&queueCounter)] UTF8String];
+        _queue = dispatch_queue_create(label, DISPATCH_QUEUE_SERIAL);
     }
     
     return self;
 }
 
+- (void)dealloc {
+#if !OS_OBJECT_USE_OBJC
+    dispatch_release(_queue);
+#endif
+}
+
 - (NSUInteger)count {
     __block NSUInteger retValue;
-    
     dispatch_sync(_queue, ^{
         retValue = [_events count];
     });
-    
     return retValue;
 }
 
 - (NSArray *)flushAllEvents {
     __block NSArray *retEvents = nil;
     
-    dispatch_barrier_sync(_queue, ^{
+    dispatch_sync(_queue, ^{
         if (_events.count > 0) {
             retEvents = [_events copy];
             [_events removeAllObjects];
@@ -143,8 +154,8 @@ static NSString * CLYSystemInfoForKey(char *key) {
     return retEvents;
 }
 
-- (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
-    dispatch_barrier_async(_queue, ^{
+- (void)pushEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
+    dispatch_sync(_queue, ^{
         __block BOOL identicalEventFound = NO;
         
         [_events enumerateObjectsUsingBlock:^(CLYEvent *event, NSUInteger idx, BOOL *stop) {
@@ -193,8 +204,9 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 @interface Countly () 
 
 @property (nonatomic) NSTimer *sessionTimer;
+@property (nonatomic) NSTimer *eventStackPopTimer;
 @property (nonatomic) CFTimeInterval sessionsLastTime;
-@property (nonatomic) CLYEventQueue *eventQueue;
+@property (nonatomic) CLYEventStack *eventStack;
 @property (nonatomic) NSString *appKey;
 @property (nonatomic) NSString *appHost;
 @property (nonatomic) NSString *UUID;
@@ -207,6 +219,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 @property (nonatomic) BOOL shouldTrackSessionDuration;
 @property (nonatomic, readonly) BOOL shouldTrackEvents;
 @property (nonatomic) BOOL evictEventsTrackingViaWWAN;
+@property (nonatomic) NSTimeInterval sessionDurationUpdateInterval;
 @end
 
 @implementation Countly
@@ -247,7 +260,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
             }
         }
         
-        self.eventQueue = [[CLYEventQueue alloc] init];
+        self.eventStack = [[CLYEventStack alloc] init];
         
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didEnterBackgroundNotification:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -266,6 +279,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     [self stopMonitoringNetworkReachability];
     [self.httpOperationQueue cancelAllOperations];
     [self.sessionTimer invalidate];
+    [self.eventStackPopTimer invalidate];
 }
 
 #pragma mark - Public Methods
@@ -277,7 +291,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     self.appHost = attributes[CountlyAttributesHost];
     self.shouldTrackSessionDuration = (attributes[CountlyAttributesSessionDurationTrackingEnabled]) ? [attributes[CountlyAttributesSessionDurationTrackingEnabled]boolValue] : YES;
     self.evictEventsTrackingViaWWAN = (attributes[CountlyAttributesEvictEventsTrackingViaWWAN]) ? [attributes[CountlyAttributesEvictEventsTrackingViaWWAN]boolValue] : NO;
-    
+    self.sessionDurationUpdateInterval = (attributes[CountlyAttributesSessionDurationUpdateInterval]) ? [attributes[CountlyAttributesSessionDurationUpdateInterval]doubleValue] : 120.;
     NSParameterAssert(self.appKey);
     NSParameterAssert(self.appHost);
     
@@ -296,93 +310,64 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     [self recordEvent:key segmentation:segmentation count:count sum:0.];
 }
 
-- (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
-    NSParameterAssert(key);
-    
-    if (!self.shouldTrackEvents) {
-        return; // avoid to accumulate events if the connection is failing.
-    }
-    
-#ifdef DEBUG
-    [segmentation.allKeys enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
-        NSAssert([obj isKindOfClass:[NSString class]], @"keys of the segmentation dictionary should be NSString objects");
-    }];
-    [segmentation.allValues enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
-        NSAssert([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]], @"keys of the segmentation dictionary should be NSString or NSNumber objects");
-    }];
-#endif
-    
-    [self.eventQueue recordEvent:key segmentation:segmentation count:count sum:sum];
-    
-    if (self.eventQueue.count >= 5) [self sendPendingEvents];
-    
-}
-
 #pragma mark - Session Management
 
 - (void)updateSessionState {
-    if (self.applicationInBackgroundState || !self.isHostReachable) {
+    BOOL stopTrackingSession = (!self.shouldTrackSessionDuration && (self.sessionState == CountlySessionStateBegan));
+
+    if (self.applicationInBackgroundState || !self.isHostReachable || stopTrackingSession) {
         [self.sessionTimer invalidate];
         self.sessionTimer = nil;
     }
     else if (!self.sessionTimer) {
-        self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self selector:@selector(timerFired:) userInfo:nil repeats:YES];
+        self.sessionTimer = [NSTimer scheduledTimerWithTimeInterval:self.sessionDurationUpdateInterval target:self selector:@selector(sessionTimerFired:) userInfo:nil repeats:YES];
     }
     
-    if (self.sessionState == CountlySessionStateStopped) {
-        self.sessionState = CountlySessionStatePending;
-        
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-            self.sessionState = CountlySessionStateStopped;
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
-        }];
-#endif
-        [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionBegin]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^(void) {
-                if (!error) {
-                    self.sessionState = CountlySessionStateBegan;
-                }
-                else {
-                    COUNTLY_LOG(@"updateSessionState - connection error: %@",error);
-                    self.sessionState = CountlySessionStateStopped;
-                }
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
-#endif
-            });
-        }];
+    if (stopTrackingSession) {
+        return;
     }
-    else if (self.shouldTrackSessionDuration && (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated)) {
+    
+    if (self.sessionState != CountlySessionStatePending) {
+        NSURLRequest *request = nil;
+        void (^callbackBlock)(BOOL, NSError *) = nil;
         
-        CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
-        CFTimeInterval duration = round(lastTime - self.sessionsLastTime);
-        self.sessionsLastTime = lastTime;
-        COUNTLY_LOG(@"session duration: %f sec.",duration);
+        if (self.sessionState == CountlySessionStateStopped) {
+            request = [self urlRequestForSessionBegin];
+            __weak __typeof(self)weakSelf = self;
+            callbackBlock = ^void(BOOL success, NSError *error) {
+                __strong __typeof(weakSelf)strongSelf = weakSelf;
+                strongSelf.sessionState = (success) ? CountlySessionStateBegan : CountlySessionStateStopped;
+                COUNTLY_LOG(@"updateSessionState (error: %@)",error);
+            };
+        }
+        else if (self.sessionState == CountlySessionStateBegan || self.sessionState == CountlySessionStateUpdated) {
+            CFTimeInterval lastTime = CFAbsoluteTimeGetCurrent();
+            CFTimeInterval duration = round(lastTime - self.sessionsLastTime);
+            self.sessionsLastTime = lastTime;
+            COUNTLY_LOG(@"session duration: %f sec.", duration);
+            request = [self urlRequestForSessionUpdateWithDuration:duration];
+            __weak __typeof(self)weakSelf = self;
+            callbackBlock = ^void(BOOL success, NSError *error) {
+                __strong __typeof(weakSelf)strongSelf = weakSelf;
+                strongSelf.sessionState = (success) ? CountlySessionStateUpdated : CountlySessionStateBegan;
+                COUNTLY_LOG(@"updateSessionState (error: %@)",error);
+            };
+        }
         
-        if (duration > 0) {
+        if (request) {
             self.sessionState = CountlySessionStatePending;
             
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
             __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-                self.sessionState = CountlySessionStateBegan;
+                if (callbackBlock) callbackBlock(NO, nil);
                 [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
             }];
 #endif
-            
-            [NSURLConnection sendAsynchronousRequest:[self urlRequestForSessionUpdateWithDuration:duration]  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-                dispatch_async(dispatch_get_main_queue(), ^(void) {
-                    if (!error) {
-                        self.sessionState = CountlySessionStateUpdated;
-                    }
-                    else {
-                        COUNTLY_LOG(@"updateSessionState - connection error: %@",error);
-                        self.sessionState = CountlySessionStateBegan;
-                    }
+            [NSURLConnection sendAsynchronousRequest:request  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+                if (callbackBlock) callbackBlock(!error, error);
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-                    [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
 #endif
-                });
             }];
         }
     }
@@ -408,39 +393,52 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     }
 }
 
-- (void)timerFired:(NSTimer *)timer {
-    [self sendPendingEvents];
+- (void)sessionTimerFired:(NSTimer *)timer {
     [self updateSessionState];
 }
 
-#pragma mark - Notifications
-
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-- (void)didEnterBackgroundNotification:(NSNotification *)notification {
-    COUNTLY_LOG(@"Countly didEnterBackgroundCallBack");
-    self.applicationInBackgroundState = YES;
-    [self updateSessionState];
-}
-
-- (void)willEnterForegroundNotification:(NSNotification *)notification {
-    COUNTLY_LOG(@"Countly willEnterForegroundCallBack");
-    self.applicationInBackgroundState = NO;
-    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
-    [self updateSessionState];
-}
-#endif
-
-#pragma mark - Countly Events Management
+#pragma mark - Events Management
 
 - (BOOL)shouldTrackEvents {
     BOOL shouldTrackEvents = (!self.evictEventsTrackingViaWWAN && (self.isHostReachable || self.networkReachabilityStatus == CLYNetworkReachabilityStatusUnknown));
     return shouldTrackEvents;
 }
 
-- (void)sendPendingEvents {
-    NSArray *events = [self.eventQueue flushAllEvents];
+- (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
+    NSParameterAssert(key);
     
-    if (events.count > 0) {
+    if (!self.shouldTrackEvents) {
+        return;
+    }
+    
+#ifdef DEBUG
+    [segmentation.allKeys enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
+        NSAssert([obj isKindOfClass:[NSString class]], @"keys of the segmentation dictionary should be NSString objects");
+    }];
+    [segmentation.allValues enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
+        NSAssert([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]], @"keys of the segmentation dictionary should be NSString or NSNumber objects");
+    }];
+#endif
+    
+    [self.eventStack pushEvent:key segmentation:segmentation count:count sum:sum];
+    
+    dispatch_async(dispatch_get_main_queue(), ^(void) {
+        if (!self.eventStackPopTimer) {
+            self.eventStackPopTimer = [NSTimer scheduledTimerWithTimeInterval:5. target:self selector:@selector(eventStackPopTimerFired:) userInfo:nil repeats:NO];
+        }
+    });
+}
+
+- (void)eventStackPopTimerFired:(NSTimer *)timer {
+    [self sendPendingEvents];
+    self.eventStackPopTimer = nil;
+}
+
+- (void)sendPendingEvents {
+    
+    NSArray *events = [self.eventStack flushAllEvents];
+    
+    if (self.shouldTrackEvents && events.count > 0) {
         
         NSMutableArray *mutableArray = [NSMutableArray array];
         
@@ -483,6 +481,24 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
         
     }
 }
+
+#pragma mark - Notifications
+
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+- (void)didEnterBackgroundNotification:(NSNotification *)notification {
+    COUNTLY_LOG(@"Countly didEnterBackgroundCallBack");
+    self.applicationInBackgroundState = YES;
+    [self updateSessionState];
+    [self sendPendingEvents];
+}
+
+- (void)willEnterForegroundNotification:(NSNotification *)notification {
+    COUNTLY_LOG(@"Countly willEnterForegroundCallBack");
+    self.applicationInBackgroundState = NO;
+    self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
+    [self updateSessionState];
+}
+#endif
 
 #pragma mark - Countly API Requests
 
@@ -615,9 +631,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 #endif
         if (_networkReachabilityStatus != CLYNetworkReachabilityStatusUnknown) {
             [self updateSessionState];
-            if (!self.shouldTrackEvents) {
-                [self.eventQueue flushAllEvents];
-            }
+            [self sendPendingEvents];
         }
     }
 }
