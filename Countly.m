@@ -30,7 +30,7 @@
 NSString * const CountlyAttributesAPIKey = @"APIKey";
 NSString * const CountlyAttributesHost = @"host";
 NSString * const CountlyAttributesSessionDurationTrackingEnabled = @"sessionDurationTrackingEnabled";
-NSString * const CountlyAttributesEvictEventsTrackingViaWWAN = @"evictEventsTrackingViaWWAN";
+NSString * const CountlyAttributesEventsSendingViaWWANEnabled = @"eventsSendingViaWWANEnabled";
 NSString * const CountlyAttributesSessionDurationUpdateInterval = @"sessionDurationUpdateInterval";
 
 NSString * const CountlyUserDefaultsUUID = @"CountlyUUID";
@@ -139,13 +139,36 @@ static int32_t queueCounter = 0;
     return retValue;
 }
 
-- (NSArray *)flushAllEvents {
+- (NSArray *)popAllEvents {
     __block NSArray *retEvents = nil;
     
     dispatch_sync(_queue, ^{
         if (_events.count > 0) {
             retEvents = [_events copy];
             [_events removeAllObjects];
+        }
+    });
+    
+    COUNTLY_LOG(@"flushAllEvents (%lu events)", (unsigned long)retEvents.count);
+    
+    return retEvents;
+}
+
+- (NSArray *)popEventsMax:(NSUInteger)maxReturnedEvents {
+    __block NSArray *retEvents = nil;
+    
+    dispatch_sync(_queue, ^{
+        if (_events.count > 0) {
+            if (maxReturnedEvents > _events.count) {
+                retEvents = [_events copy];
+                [_events removeAllObjects];
+            }
+            else {
+                NSSortDescriptor *sortDescriptor = [NSSortDescriptor sortDescriptorWithKey:@"timestamp" ascending:YES];
+                NSArray *sortedEvents = [_events sortedArrayUsingDescriptors:@[sortDescriptor]];
+                retEvents = [sortedEvents subarrayWithRange:NSMakeRange(0, maxReturnedEvents)];
+                [_events removeObjectsInArray:retEvents];
+            }
         }
     });
     
@@ -217,8 +240,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 @property (nonatomic) CLYNetworkReachabilityStatus networkReachabilityStatus;
 @property (nonatomic, readonly) BOOL isHostReachable;
 @property (nonatomic) BOOL shouldTrackSessionDuration;
-@property (nonatomic, readonly) BOOL shouldTrackEvents;
-@property (nonatomic) BOOL evictEventsTrackingViaWWAN;
+@property (nonatomic) BOOL shouldSendEventsViaWWAN;
 @property (nonatomic) NSTimeInterval sessionDurationUpdateInterval;
 @end
 
@@ -290,7 +312,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
     self.appKey = attributes[CountlyAttributesAPIKey];
     self.appHost = attributes[CountlyAttributesHost];
     self.shouldTrackSessionDuration = (attributes[CountlyAttributesSessionDurationTrackingEnabled]) ? [attributes[CountlyAttributesSessionDurationTrackingEnabled]boolValue] : YES;
-    self.evictEventsTrackingViaWWAN = (attributes[CountlyAttributesEvictEventsTrackingViaWWAN]) ? [attributes[CountlyAttributesEvictEventsTrackingViaWWAN]boolValue] : NO;
+    self.shouldSendEventsViaWWAN = (attributes[CountlyAttributesEventsSendingViaWWANEnabled]) ? [attributes[CountlyAttributesEventsSendingViaWWANEnabled]boolValue] : YES;
     self.sessionDurationUpdateInterval = (attributes[CountlyAttributesSessionDurationUpdateInterval]) ? [attributes[CountlyAttributesSessionDurationUpdateInterval]doubleValue] : 120.;
     NSParameterAssert(self.appKey);
     NSParameterAssert(self.appHost);
@@ -359,12 +381,16 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
             
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
             __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-                if (callbackBlock) callbackBlock(NO, nil);
+                dispatch_async(dispatch_get_main_queue(), ^(void) {
+                    if (callbackBlock) callbackBlock(NO, nil);
+                });
                 [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
             }];
 #endif
             [NSURLConnection sendAsynchronousRequest:request  queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-                if (callbackBlock) callbackBlock(!error, error);
+                dispatch_async(dispatch_get_main_queue(), ^(void) {
+                    if (callbackBlock) callbackBlock(!error, error);
+                });
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
                 [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
 #endif
@@ -375,6 +401,7 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 
 - (void)setSessionState:(CountlySessionState)sessionState {
     if (sessionState != _sessionState) {
+        NSAssert([NSThread isMainThread], @"should be called on the main thread");
         _sessionState = sessionState;
 #ifdef DEBUG
         if (_sessionState == CountlySessionStateBegan) {
@@ -399,18 +426,9 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 
 #pragma mark - Events Management
 
-- (BOOL)shouldTrackEvents {
-    BOOL shouldTrackEvents = (!self.evictEventsTrackingViaWWAN && (self.isHostReachable || self.networkReachabilityStatus == CLYNetworkReachabilityStatusUnknown));
-    return shouldTrackEvents;
-}
-
 - (void)recordEvent:(NSString *)key segmentation:(NSDictionary *)segmentation count:(NSUInteger)count sum:(CGFloat)sum {
     NSParameterAssert(key);
-    
-    if (!self.shouldTrackEvents) {
-        return;
-    }
-    
+
 #ifdef DEBUG
     [segmentation.allKeys enumerateObjectsWithOptions:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
         NSAssert([obj isKindOfClass:[NSString class]], @"keys of the segmentation dictionary should be NSString objects");
@@ -436,49 +454,53 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 
 - (void)sendPendingEvents {
     
-    NSArray *events = [self.eventStack flushAllEvents];
+    BOOL shouldSendEvents = self.isHostReachable &&  (self.shouldSendEventsViaWWAN || (!self.shouldSendEventsViaWWAN && self.networkReachabilityStatus != CLYNetworkReachabilityStatusReachableViaWWAN));
     
-    if (self.shouldTrackEvents && events.count > 0) {
-        
-        NSMutableArray *mutableArray = [NSMutableArray array];
-        
-        [events enumerateObjectsWithOptions:0 usingBlock:^(CLYEvent *event, NSUInteger idx, BOOL *stop) {
-            NSMutableDictionary *mutableDictionary = [NSMutableDictionary dictionary];
-            [mutableDictionary setObject:event.key forKey:@"key"];
-            [mutableDictionary setObject:@(event.count) forKey:@"count"];
-            [mutableDictionary setObject:@(event.timestamp) forKey:@"timestamp"];
-            if (event.sum > 0) [mutableDictionary setObject:@(event.sum) forKey:@"sum"];
-            if (event.segmentation.allKeys.count > 0) [mutableDictionary setObject:event.segmentation forKey:@"segmentation"];
+    if (shouldSendEvents) {
+        const NSUInteger maxEventsPerRequest = 30;
+        NSArray *events = [self.eventStack popEventsMax:maxEventsPerRequest];
+        while (events.count > 0) {
+            NSMutableArray *mutableArray = [NSMutableArray array];
             
-            [mutableArray addObject:mutableDictionary];
-        }];
-        
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableArray options:0 error:nil];
-        NSString *jsonEncodedEvents = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-        
-        NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&events=%@",
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
-                          time(NULL),
-                          CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedEvents)];
-        
-        NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
-        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-        
+            [events enumerateObjectsWithOptions:0 usingBlock:^(CLYEvent *event, NSUInteger idx, BOOL *stop) {
+                NSMutableDictionary *mutableDictionary = [NSMutableDictionary dictionary];
+                [mutableDictionary setObject:event.key forKey:@"key"];
+                [mutableDictionary setObject:@(event.count) forKey:@"count"];
+                [mutableDictionary setObject:@(event.timestamp) forKey:@"timestamp"];
+                if (event.sum > 0) [mutableDictionary setObject:@(event.sum) forKey:@"sum"];
+                if (event.segmentation.allKeys.count > 0) [mutableDictionary setObject:event.segmentation forKey:@"segmentation"];
+                
+                [mutableArray addObject:mutableDictionary];
+            }];
+            
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:mutableArray options:0 error:nil];
+            NSString *jsonEncodedEvents = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            
+            NSString *data = [NSString stringWithFormat:@"app_key=%@&device_id=%@&timestamp=%ld&events=%@",
+                              CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.appKey),
+                              CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(self.UUID),
+                              time(NULL),
+                              CLYPercentEscapedQueryStringPairMemberFromStringWithEncoding(jsonEncodedEvents)];
+            
+            NSString *urlString = [NSString stringWithFormat:@"%@/i?%@", self.appHost, data];
+            NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+            
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-        __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
-        }];
+            __block UIBackgroundTaskIdentifier backgroundTaskIdentifier = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+            }];
 #endif
-        
-        COUNTLY_LOG(@"sendPendingEvents - start");
-        [NSURLConnection sendAsynchronousRequest:request queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
-            COUNTLY_LOG(@"sendPendingEvents - finished");
+            COUNTLY_LOG(@"sendPendingEvents - start");
+            [NSURLConnection sendAsynchronousRequest:request queue:self.httpOperationQueue completionHandler:^(NSURLResponse *response, NSData *data, NSError *error) {
+                COUNTLY_LOG(@"sendPendingEvents - finished (error: %@)",error);
+                // PS: if an error occurs, the events are lost. Could be improved. Note that we first check that the host is available but it's not enough,
+                // an error could occur during the request life-time.
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
+                [[UIApplication sharedApplication] endBackgroundTask:backgroundTaskIdentifier];
 #endif
-        }];
-        
+            }];
+            events = [self.eventStack popEventsMax:maxEventsPerRequest];
+        }
     }
 }
 
@@ -493,8 +515,15 @@ typedef void (^CLYNetworkReachabilityStatusBlock)(CLYNetworkReachabilityStatus s
 }
 
 - (void)willEnterForegroundNotification:(NSNotification *)notification {
-    COUNTLY_LOG(@"Countly willEnterForegroundCallBack");
     self.applicationInBackgroundState = NO;
+    
+    CFTimeInterval duration = round(CFAbsoluteTimeGetCurrent() - self.sessionsLastTime);
+    COUNTLY_LOG(@"Countly willEnterForegroundCallBack (duration in background: %f sec)",duration);
+    const NSUInteger sleepMaxDurationMinutes = 10;
+    if (duration < 0 || duration > (60*sleepMaxDurationMinutes)) { // if the wake-up occurs after 10 minutes, we consider it as a new session
+        COUNTLY_LOG(@"session restarted (wake-up longer than %lu min.)",(unsigned long)sleepMaxDurationMinutes);
+        self.sessionState = CountlySessionStateStopped;
+    }
     self.sessionsLastTime = CFAbsoluteTimeGetCurrent();
     [self updateSessionState];
 }
